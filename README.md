@@ -5,10 +5,10 @@ a crash-safe job queue: writes go through the log first, so a `kill -9`
 mid-write doesn't silently lose work.
 
 This is an early slice of the project. Right now `spool` provides the raw
-log primitive — append records, replay them back in order — and nothing
-above it yet. There is no queue API (enqueue/lease/ack), no crash recovery
-for a torn last write, and no fsync policy control. See "Status" below for
-exactly what that means in practice.
+log primitive — append records, replay them back in order, and recover
+cleanly from a torn last write. There is no queue API (enqueue/lease/ack)
+and no fsync policy control yet. See "Status" below for exactly what that
+means in practice.
 
 ## Install
 
@@ -70,14 +70,23 @@ What this gives you today:
   silent bit-rot in a fully-written record is caught, not returned as data.
 - `Replay` on a path that doesn't exist yet returns an empty log, not an
   error, so callers can treat "no log file" and "empty log" the same way.
+- Recovery from a torn write. If the process is killed mid-`Append`, the log
+  file ends with a partial header, a partial payload, or a payload that
+  landed corrupted — `Replay` discards that trailing record and returns
+  everything before it, with no error. This only applies to the *last*
+  record physically in the file: a checksum mismatch on a record that has
+  more valid log after it can't be a torn write (`Append` only ever extends
+  the file), so it's treated as real corruption and `Replay` returns a hard
+  error instead of silently dropping data.
+- What torn-write recovery does **not** cover: if a crash happens and the
+  process later reopens the same file and keeps appending, the new records
+  land immediately after the torn bytes with no boundary between them —
+  `Open` doesn't yet truncate the file back to the last valid record on
+  startup. In practice this means recovery only helps if you replay before
+  writing again.
 
 What this does **not** give you yet:
 
-- No recovery from a torn write. If the process is killed mid-`Append` (log
-  file ends partway through a header or payload), `Replay` currently
-  returns an error on the truncated trailing record instead of discarding
-  it and returning everything before it — that recovery behavior is the
-  next thing to build here, not something already in place.
 - No fsync — `Append` writes go through the OS page cache like any other
   file write. A power loss (as opposed to a killed process) can still lose
   the last writes that hadn't reached disk. An fsync policy (every write,

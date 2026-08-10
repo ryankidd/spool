@@ -48,6 +48,12 @@ func (l *Log) Append(data []byte) error {
 // Replay reads every record from the log file at path, in the order they
 // were appended, calling fn with each record's payload. A missing file is
 // treated as an empty log, not an error.
+//
+// A torn write — the process was killed partway through Append — leaves a
+// truncated header or payload at the physical end of the file. Replay
+// discards that trailing partial record and returns everything before it
+// with no error, rather than failing the whole replay over an in-progress
+// write that never completed.
 func Replay(path string, fn func(data []byte) error) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -62,6 +68,13 @@ func Replay(path string, fn func(data []byte) error) error {
 	for {
 		if _, err := io.ReadFull(f, header); err != nil {
 			if err == io.EOF {
+				// Clean boundary: the last record ended exactly at EOF.
+				return nil
+			}
+			if err == io.ErrUnexpectedEOF {
+				// A partial header can only happen if the file physically
+				// ends here — a torn write from a killed process. Discard
+				// it and keep everything read so far.
 				return nil
 			}
 			return fmt.Errorf("spool: read record header: %w", err)
@@ -72,6 +85,11 @@ func Replay(path string, fn func(data []byte) error) error {
 
 		data := make([]byte, length)
 		if _, err := io.ReadFull(f, data); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				// Same reasoning as the header case: a truncated payload
+				// only occurs at the physical end of the file.
+				return nil
+			}
 			return fmt.Errorf("spool: read record payload: %w", err)
 		}
 		if gotCRC := crc32.ChecksumIEEE(data); gotCRC != wantCRC {

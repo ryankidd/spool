@@ -93,7 +93,23 @@ func Replay(path string, fn func(data []byte) error) error {
 			return fmt.Errorf("spool: read record payload: %w", err)
 		}
 		if gotCRC := crc32.ChecksumIEEE(data); gotCRC != wantCRC {
-			return fmt.Errorf("spool: checksum mismatch: want %x got %x", wantCRC, gotCRC)
+			// A checksum mismatch on the record at the physical end of the
+			// file is indistinguishable from a torn write (the header
+			// landed on disk but the payload didn't finish, or landed
+			// corrupted) and is handled the same way: discard it, return
+			// everything before it. But a torn write can only ever leave
+			// garbage at the tail, since Append only ever extends the
+			// file — it cannot explain a bad checksum with more valid log
+			// after it. If more bytes follow, this is real corruption in
+			// the middle of the log, not a crash artifact, and silently
+			// dropping it would risk losing already-acknowledged records
+			// that happen to sit downstream. That case is a hard error.
+			var probe [1]byte
+			n, _ := f.Read(probe[:])
+			if n == 0 {
+				return nil
+			}
+			return fmt.Errorf("spool: checksum mismatch mid-log (not at tail): want %x got %x", wantCRC, gotCRC)
 		}
 		if err := fn(data); err != nil {
 			return err

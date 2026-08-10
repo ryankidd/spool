@@ -129,6 +129,107 @@ func TestReplayTruncatedPayload(t *testing.T) {
 	}
 }
 
+func TestReplayCorruptTrailingRecordDiscarded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.log")
+
+	l, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	records := [][]byte{[]byte("first"), []byte("second")}
+	for _, r := range records {
+		if err := l.Append(r); err != nil {
+			t.Fatalf("Append(%q): %v", r, err)
+		}
+	}
+	if err := l.Append([]byte("third")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Flip a bit in the last record's payload without touching its length
+	// or checksum, simulating a write that landed corrupted on disk.
+	flipLastByte(t, path)
+
+	var got [][]byte
+	err = Replay(path, func(data []byte) error {
+		cp := make([]byte, len(data))
+		copy(cp, data)
+		got = append(got, cp)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if !reflect.DeepEqual(got, records) {
+		t.Fatalf("Replay returned %q, want %q", got, records)
+	}
+}
+
+func TestReplayCorruptMidLogRecordFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.log")
+
+	l, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := l.Append([]byte("first")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	offset := fileSize(t, path)
+	if err := l.Append([]byte("second")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := l.Append([]byte("third")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Corrupt "second"'s payload (which is followed by "third", still
+	// intact) by flipping a bit partway through the file rather than at
+	// the very end.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	// offset points at the start of the second record's header; the
+	// payload starts 8 bytes in.
+	if _, err := f.WriteAt([]byte{0xFF}, offset+8); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	err = Replay(path, func([]byte) error { return nil })
+	if err == nil {
+		t.Fatal("Replay of mid-log corruption returned nil error, want an error")
+	}
+}
+
+func flipLastByte(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer f.Close()
+
+	size := fileSize(t, path)
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], size-1); err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	b[0] ^= 0xFF
+	if _, err := f.WriteAt(b[:], size-1); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+}
+
 func fileSize(t *testing.T, path string) int64 {
 	t.Helper()
 	info, err := os.Stat(path)

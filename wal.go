@@ -1,4 +1,6 @@
-// Package spool implements an append-only write-ahead log.
+// Package spool implements a durable job queue on top of an append-only
+// write-ahead log. Log holds the raw log primitive; Queue layers enqueue,
+// lease and ack semantics over it.
 package spool
 
 import (

@@ -65,6 +65,11 @@ type jobState struct {
 	deadline   time.Time
 }
 
+// firstLeaseID is where lease ids start. Zero is reserved as the "not
+// leased" marker in jobState, so handing it out as a real lease id would let
+// an expired lease ack a job that had already been released.
+const firstLeaseID = 1
+
 // Queue is a durable job queue built on a write-ahead log. Every state
 // transition — enqueue, lease, ack — is appended to the log before it takes
 // effect, so the queue's state is exactly the fold of its log and survives a
@@ -99,9 +104,10 @@ func WithClock(c Clock) Option {
 // exist yet gives an empty queue.
 func OpenQueue(path string, opts ...Option) (*Queue, error) {
 	q := &Queue{
-		clock:  systemClock{},
-		jobs:   make(map[uint64]*jobState),
-		leased: make(map[uint64]struct{}),
+		clock:     systemClock{},
+		jobs:      make(map[uint64]*jobState),
+		leased:    make(map[uint64]struct{}),
+		nextLease: firstLeaseID,
 	}
 	for _, opt := range opts {
 		opt(q)

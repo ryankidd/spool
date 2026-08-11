@@ -203,9 +203,43 @@ func (q *Queue) Enqueue(payload []byte) (uint64, error) {
 	return id, nil
 }
 
+// reclaimLocked returns every job whose lease has expired to the ready
+// queue, oldest job first. Expiry writes nothing to the log: it isn't a
+// decision the queue makes, it's the absence of an ack by a deadline, and
+// replaying the log recomputes it. That keeps a queue full of slow consumers
+// from growing the log while no work is completing.
+//
+// This costs a scan of the leased set, not of every job, so it stays
+// proportional to the number of consumers in flight.
+func (q *Queue) reclaimLocked(now time.Time) {
+	var expired []uint64
+	for id := range q.leased {
+		if js := q.jobs[id]; now.After(js.deadline) {
+			expired = append(expired, id)
+		}
+	}
+	if len(expired) == 0 {
+		return
+	}
+
+	// Map iteration order is random; sort so redelivery order is
+	// deterministic when several leases expire at once.
+	sort.Slice(expired, func(i, j int) bool { return expired[i] < expired[j] })
+	for _, id := range expired {
+		q.jobs[id].lease = 0
+		delete(q.leased, id)
+		q.ready = append(q.ready, id)
+	}
+}
+
 // Lease hands the oldest ready job to the caller with a deadline d in the
 // future. The job stays off the ready queue until it is acked or its lease
 // expires. If no job is ready, Lease returns ErrEmpty.
+//
+// A job whose lease expires without an ack goes back on the ready queue, at
+// the tail, and is handed to whichever consumer leases next. Delivery is
+// therefore at least once: a consumer that does the work and dies before
+// acking, or that overruns its deadline, will see the job delivered again.
 func (q *Queue) Lease(d time.Duration) (*Job, error) {
 	if d <= 0 {
 		return nil, errors.New("spool: lease duration must be positive")
@@ -217,6 +251,9 @@ func (q *Queue) Lease(d time.Duration) (*Job, error) {
 	if q.closed {
 		return nil, ErrClosed
 	}
+
+	now := q.clock.Now()
+	q.reclaimLocked(now)
 	if len(q.ready) == 0 {
 		return nil, ErrEmpty
 	}
@@ -234,7 +271,7 @@ func (q *Queue) Lease(d time.Duration) (*Job, error) {
 	q.leased[id] = struct{}{}
 	q.nextLease++
 	js.lease = lease
-	js.deadline = q.clock.Now().Add(d)
+	js.deadline = now.Add(d)
 	js.deliveries++
 
 	return &Job{
@@ -247,7 +284,13 @@ func (q *Queue) Lease(d time.Duration) (*Job, error) {
 }
 
 // Ack durably marks a leased job as done and removes it from the queue. It
-// returns ErrLeaseExpired if j is not the current delivery of that job.
+// returns ErrLeaseExpired if j is not the current delivery of that job —
+// because the deadline passed, or because the job was already acked.
+//
+// The deadline is enforced strictly: an ack that arrives after it fails even
+// if no other consumer has picked the job up yet. A lease that could be acked
+// late would be no deadline at all, and the consumer holding it has no way to
+// know whether its work was still wanted.
 func (q *Queue) Ack(j *Job) error {
 	if j == nil {
 		return errors.New("spool: ack of a nil job")
@@ -259,6 +302,7 @@ func (q *Queue) Ack(j *Job) error {
 	if q.closed {
 		return ErrClosed
 	}
+	q.reclaimLocked(q.clock.Now())
 
 	js, ok := q.jobs[j.ID]
 	if !ok || js.lease != j.LeaseID {
@@ -275,11 +319,13 @@ func (q *Queue) Ack(j *Job) error {
 	return nil
 }
 
-// Stats reports how many jobs are ready and how many are leased.
+// Stats reports how many jobs are ready and how many are leased. Leases that
+// have already expired are counted as ready, not as leased.
 func (q *Queue) Stats() Stats {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	q.reclaimLocked(q.clock.Now())
 	return Stats{Ready: len(q.ready), Leased: len(q.leased)}
 }
 

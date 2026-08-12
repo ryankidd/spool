@@ -158,6 +158,14 @@ What this gives you today:
   more valid log after it can't be a torn write (`Append` only ever extends
   the file), so it's treated as real corruption and `Replay` returns a hard
   error instead of silently dropping data.
+- Repeated recovery. `Open` truncates a torn trailing record away before it
+  accepts any append, so the next write starts at the end of the last intact
+  record rather than after the damaged bytes. Crashing mid-`Append`,
+  reopening, and crashing again is survivable arbitrarily many times, not
+  once. Mid-log corruption is reported by `Open` too, and the file is left
+  untouched in that case — truncating there would discard valid records
+  sitting behind the damage.
+
 What this does **not** give you yet:
 
 - Not exactly-once. See "Delivery semantics" above: a job whose lease expires
@@ -168,13 +176,6 @@ What this does **not** give you yet:
   the tail of the log: a job that `Enqueue` returned successfully, or an ack
   that will therefore be redelivered. An fsync policy (every write, or on an
   interval) is planned but not implemented.
-- **Torn writes are only survivable once.** `Replay` discards a torn trailing
-  record, but `OpenQueue` then reopens the file and appends after those torn
-  bytes rather than truncating back to the last valid record. The next replay
-  reads the leftover bytes as a record header, and the mismatch that follows
-  is mid-log, not at the tail — a hard error. So a queue reopened after a
-  crash mid-`Append` works, and a queue reopened *twice* may refuse to open.
-  Truncate-on-open is the fix and isn't written yet.
 - No compaction. The log records every transition forever, including jobs
   that were acked long ago, so the file grows with throughput rather than
   with queue depth, and open time is proportional to total history. A

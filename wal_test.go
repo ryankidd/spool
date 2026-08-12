@@ -250,3 +250,124 @@ func TestReplayMissingFile(t *testing.T) {
 		t.Fatalf("Replay on missing file called fn %d times, want 0", calls)
 	}
 }
+
+func TestOpenTruncatesTornTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.log")
+
+	l, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := l.Append([]byte("first")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	afterFirst := fileSize(t, path)
+	if err := l.Append([]byte("second")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Crash partway through the second record's payload.
+	if err := os.Truncate(path, afterFirst+8+2); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+
+	l, err = Open(path)
+	if err != nil {
+		t.Fatalf("Open after torn write: %v", err)
+	}
+	if got := fileSize(t, path); got != afterFirst {
+		t.Fatalf("file size after Open = %d, want %d (torn tail not truncated)", got, afterFirst)
+	}
+	if err := l.Append([]byte("third")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The append landed at the end of the last intact record, so the log is
+	// clean — and stays clean across another reopen, which is where writing
+	// past the torn bytes used to surface as mid-log corruption.
+	want := [][]byte{[]byte("first"), []byte("third")}
+	if got := replayAll(t, path); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Replay returned %q, want %q", got, want)
+	}
+
+	l, err = Open(path)
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	if err := l.Append([]byte("fourth")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	want = append(want, []byte("fourth"))
+	if got := replayAll(t, path); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Replay after second reopen returned %q, want %q", got, want)
+	}
+}
+
+func TestOpenLeavesMidLogCorruptionAlone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.log")
+
+	l, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := l.Append([]byte("first")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	corruptAt := fileSize(t, path)
+	if err := l.Append([]byte("second")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := l.Append([]byte("third")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	before := fileSize(t, path)
+
+	// Corrupt the second record's payload, leaving a valid third record
+	// behind it: not a torn write, so nothing may be thrown away.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], corruptAt+8); err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	b[0] ^= 0xFF
+	if _, err := f.WriteAt(b[:], corruptAt+8); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+	f.Close()
+
+	if _, err := Open(path); err == nil {
+		t.Fatal("Open succeeded on a log with mid-log corruption, want error")
+	}
+	if got := fileSize(t, path); got != before {
+		t.Fatalf("file size after failed Open = %d, want %d (data was discarded)", got, before)
+	}
+}
+
+func replayAll(t *testing.T, path string) [][]byte {
+	t.Helper()
+	var got [][]byte
+	if err := Replay(path, func(data []byte) error {
+		cp := make([]byte, len(data))
+		copy(cp, data)
+		got = append(got, cp)
+		return nil
+	}); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	return got
+}

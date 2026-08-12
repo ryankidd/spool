@@ -19,11 +19,38 @@ type Log struct {
 }
 
 // Open opens (creating if necessary) the log file at path for appending.
+//
+// If the log ends in a torn write, Open truncates the file back to the end
+// of the last intact record before accepting any append. Without that, the
+// next Append would write past the partial record and cement it in the
+// middle of the log, where Replay can no longer tell a crash artifact from
+// real corruption — so the damage would only become visible on the reopen
+// after next. Mid-log corruption is reported here rather than truncated
+// away, since discarding it would throw out valid records behind it.
 func Open(path string) (*Log, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("spool: open %s: %w", path, err)
 	}
+
+	valid, err := scanRecords(f, nil)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("spool: stat %s: %w", path, err)
+	}
+	if info.Size() > valid {
+		if err := f.Truncate(valid); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("spool: truncate %s to %d: %w", path, valid, err)
+		}
+	}
+
 	return &Log{f: f}, nil
 }
 
@@ -66,20 +93,34 @@ func Replay(path string, fn func(data []byte) error) error {
 	}
 	defer f.Close()
 
+	_, err = scanRecords(f, fn)
+	return err
+}
+
+// scanRecords walks the log from the current offset of f, calling fn (which
+// may be nil) with each intact record's payload, and returns the offset just
+// past the last intact record. A trailing partial or corrupt record stops the
+// scan without an error; corruption with valid log after it is an error.
+func scanRecords(f *os.File, fn func(data []byte) error) (int64, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("spool: seek to start: %w", err)
+	}
+
+	var valid int64
 	header := make([]byte, 8)
 	for {
 		if _, err := io.ReadFull(f, header); err != nil {
 			if err == io.EOF {
 				// Clean boundary: the last record ended exactly at EOF.
-				return nil
+				return valid, nil
 			}
 			if err == io.ErrUnexpectedEOF {
 				// A partial header can only happen if the file physically
 				// ends here — a torn write from a killed process. Discard
 				// it and keep everything read so far.
-				return nil
+				return valid, nil
 			}
-			return fmt.Errorf("spool: read record header: %w", err)
+			return valid, fmt.Errorf("spool: read record header: %w", err)
 		}
 
 		length := binary.BigEndian.Uint32(header[0:4])
@@ -90,9 +131,9 @@ func Replay(path string, fn func(data []byte) error) error {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				// Same reasoning as the header case: a truncated payload
 				// only occurs at the physical end of the file.
-				return nil
+				return valid, nil
 			}
-			return fmt.Errorf("spool: read record payload: %w", err)
+			return valid, fmt.Errorf("spool: read record payload: %w", err)
 		}
 		if gotCRC := crc32.ChecksumIEEE(data); gotCRC != wantCRC {
 			// A checksum mismatch on the record at the physical end of the
@@ -109,12 +150,15 @@ func Replay(path string, fn func(data []byte) error) error {
 			var probe [1]byte
 			n, _ := f.Read(probe[:])
 			if n == 0 {
-				return nil
+				return valid, nil
 			}
-			return fmt.Errorf("spool: checksum mismatch mid-log (not at tail): want %x got %x", wantCRC, gotCRC)
+			return valid, fmt.Errorf("spool: checksum mismatch mid-log (not at tail): want %x got %x", wantCRC, gotCRC)
 		}
-		if err := fn(data); err != nil {
-			return err
+		if fn != nil {
+			if err := fn(data); err != nil {
+				return valid, err
+			}
 		}
+		valid += int64(len(header)) + int64(length)
 	}
 }

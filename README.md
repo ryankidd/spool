@@ -68,6 +68,7 @@ func main() {
 | `Stats() Stats` | Counts of ready and leased jobs. Expired leases count as ready. |
 | `Close() error` | Closes the log. Later calls return `ErrClosed`. |
 | `WithClock(c)` | Option replacing the clock used for lease deadlines — mainly so tests can expire a lease without sleeping. |
+| `WithSync(p)` | Option choosing when the log fsyncs: `SyncEveryAppend()` (default) or `SyncEvery(d)` for a looser, higher-throughput policy. See "Durability and fsync". |
 
 A `Job` carries its `ID` (stable across redeliveries), `Payload`, `LeaseID`
 (new on every delivery), `Deadline`, and `Deliveries`, the number of times it
@@ -108,6 +109,49 @@ ready, in enqueue order, with its delivery count intact.
 Expired leases are reclaimed lazily, when `Lease`, `Ack`, or `Stats` is
 called. There is no timer goroutine, so a queue nobody is polling won't
 redeliver anything on its own.
+
+### Durability and fsync
+
+A write reaches the OS page cache immediately and, from there, survives the
+writing process being killed — a `kill -9` mid-`Append` loses at most the one
+torn record, which recovery already handles. It does **not** survive a power
+loss or kernel panic until it has been `fsync`ed to the disk. `WithSync`
+chooses when that `fsync` happens, and the choice is a straight durability /
+throughput trade:
+
+- **`SyncEveryAppend()` (default).** Every `Enqueue`, `Lease` and `Ack`
+  `fsync`s the log before it returns. When one of those calls reports success,
+  its record is on stable storage and survives a power loss — nothing
+  acknowledged is ever lost. The cost is a disk round-trip per operation.
+
+- **`SyncEvery(d)`.** The log `fsync`s at most once per interval `d`, so a run
+  of appends inside the same interval is flushed by a single sync. Everything
+  up to the last sync is durable; the writes made **since** the last sync are
+  only in the page cache, and a power loss or kernel panic discards them. For
+  the queue that means a bounded tail is at risk: an `Enqueue` that returned an
+  id can vanish, and an `Ack` can be lost so its job is redelivered on the next
+  open. It never risks more than that un-synced tail — records before the last
+  sync, and the log's structure, are unaffected.
+
+  Two honest caveats on `SyncEvery(d)`:
+
+  - The sync is **lazy** — it fires on the first append that finds `d` has
+    elapsed since the last sync, and there is no background flusher. So the
+    window is bounded by "writes since the last sync", not strictly by `d` of
+    wall-clock time: a single append followed by an idle period is not synced
+    until the next append. `Close` covers the graceful case (below); only a
+    crash during that idle window exposes the tail.
+  - `d <= 0` degenerates to syncing on every append, same as
+    `SyncEveryAppend()`.
+
+`Close` always `fsync`s before it closes the file, under either policy, so an
+orderly shutdown is durable regardless of the sync policy — only a crash inside
+an un-synced window loses anything. Torn-write recovery is unchanged either
+way: whatever did reach the disk is what `Open` recovers, truncating a torn
+trailing record before the next append.
+
+The same option is available on the raw log as `Open(path,
+spool.WithSyncPolicy(p))`.
 
 ## On-disk format
 
@@ -150,6 +194,11 @@ What this gives you today:
   silent bit-rot in a fully-written record is caught, not returned as data.
 - `Replay` on a path that doesn't exist yet returns an empty log, not an
   error, so callers can treat "no log file" and "empty log" the same way.
+- A configurable `fsync` policy. By default every append is `fsync`ed before
+  it returns, so anything the queue acknowledged survives a power loss, not
+  just a killed process; `WithSync(SyncEvery(d))` relaxes that to at most one
+  sync per interval, trading a bounded un-synced tail for throughput. Both are
+  spelled out under "Durability and fsync", and `Close` flushes under either.
 - Recovery from a torn write. If the process is killed mid-`Append`, the log
   file ends with a partial header, a partial payload, or a payload that
   landed corrupted — `Replay` discards that trailing record and returns
@@ -170,12 +219,6 @@ What this does **not** give you yet:
 
 - Not exactly-once. See "Delivery semantics" above: a job whose lease expires
   is delivered again, whether or not the work was actually done.
-- No fsync — `Append` writes go through the OS page cache like any other
-  file write. A power loss (as opposed to a killed process) can still lose
-  the last writes that hadn't reached disk, which for the queue means losing
-  the tail of the log: a job that `Enqueue` returned successfully, or an ack
-  that will therefore be redelivered. An fsync policy (every write, or on an
-  interval) is planned but not implemented.
 - No compaction. The log records every transition forever, including jobs
   that were acked long ago, so the file grows with throughput rather than
   with queue depth, and open time is proportional to total history. A

@@ -9,13 +9,82 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"time"
 )
+
+// SyncPolicy decides when a Log forces its appended records to stable storage
+// with fsync. A write that has only reached the OS page cache survives the
+// writing process being killed, but not a power loss or kernel panic — fsync
+// is what closes that gap, at the cost of a disk round-trip per sync.
+//
+// The zero value is not a valid policy; build one with SyncEveryAppend or
+// SyncEvery.
+type SyncPolicy struct {
+	// everyAppend syncs after each Append. When false the policy is
+	// interval-based.
+	everyAppend bool
+	// interval is the minimum time between syncs for the interval policy.
+	interval time.Duration
+}
+
+// SyncEveryAppend returns the strongest policy: every Append is followed by an
+// fsync before it returns, so a record that Append reported as written has
+// reached stable storage and survives a power loss. This is the default and
+// the slowest, since each append pays a disk round-trip.
+func SyncEveryAppend() SyncPolicy {
+	return SyncPolicy{everyAppend: true}
+}
+
+// SyncEvery returns a looser policy that syncs at most once per interval,
+// checked against the log's clock as appends happen. It trades durability for
+// throughput: between syncs, and after the last append during an idle period,
+// records sit in the page cache and a power loss discards them — a bounded
+// tail of un-synced writes, not the whole log. A non-positive interval syncs
+// on every append, matching SyncEveryAppend.
+//
+// The check is lazy: a sync only fires on an Append that finds the interval
+// has elapsed since the last one, so there is no background goroutine and no
+// timer. A single append followed by a long silence is therefore not synced
+// until the next append or Close — see Close, which always flushes.
+func SyncEvery(interval time.Duration) SyncPolicy {
+	if interval < 0 {
+		interval = 0
+	}
+	return SyncPolicy{interval: interval}
+}
+
+// LogOption configures a Log at Open time.
+type LogOption func(*Log)
+
+// WithSyncPolicy sets the policy deciding when the log fsyncs. The default,
+// used when this option is absent, is SyncEveryAppend.
+func WithSyncPolicy(p SyncPolicy) LogOption {
+	return func(l *Log) { l.policy = p }
+}
+
+// withClock sets the clock the interval sync policy consults. It is
+// unexported because only the interval policy uses it and the queue passes its
+// own clock down; direct callers get the system clock and rarely need another.
+func withClock(c Clock) LogOption {
+	return func(l *Log) { l.clock = c }
+}
 
 // Log is an append-only write-ahead log backed by a file. Each record is
 // stored as a 4-byte big-endian length, a 4-byte CRC32 checksum of the
 // payload, then the payload itself.
 type Log struct {
-	f *os.File
+	f      *os.File
+	clock  Clock
+	policy SyncPolicy
+
+	// syncFn performs the actual fsync. It defaults to f.Sync and is a field
+	// so tests can observe how often the policy triggers a sync.
+	syncFn func() error
+	// lastSync is when the interval policy last synced; started reports
+	// whether it has been set, so the first append can seed the window
+	// without treating a zero time as long ago.
+	lastSync time.Time
+	started  bool
 }
 
 // Open opens (creating if necessary) the log file at path for appending.
@@ -27,7 +96,10 @@ type Log struct {
 // real corruption — so the damage would only become visible on the reopen
 // after next. Mid-log corruption is reported here rather than truncated
 // away, since discarding it would throw out valid records behind it.
-func Open(path string) (*Log, error) {
+//
+// By default every Append is fsynced before it returns; pass WithSyncPolicy to
+// trade that for a looser interval policy. See SyncPolicy.
+func Open(path string, opts ...LogOption) (*Log, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("spool: open %s: %w", path, err)
@@ -51,15 +123,29 @@ func Open(path string) (*Log, error) {
 		}
 	}
 
-	return &Log{f: f}, nil
+	l := &Log{f: f, clock: systemClock{}, policy: SyncEveryAppend()}
+	l.syncFn = l.f.Sync
+	for _, opt := range opts {
+		opt(l)
+	}
+	return l, nil
 }
 
-// Close closes the underlying log file.
+// Close flushes any writes the sync policy has not yet forced to disk and then
+// closes the underlying file. A clean Close is therefore durable regardless of
+// policy: the loose interval policy only leaves a tail un-synced across a
+// crash, never across an orderly shutdown.
 func (l *Log) Close() error {
-	return l.f.Close()
+	syncErr := l.syncFn()
+	closeErr := l.f.Close()
+	if syncErr != nil {
+		return fmt.Errorf("spool: sync log on close: %w", syncErr)
+	}
+	return closeErr
 }
 
-// Append writes data to the log as a new record.
+// Append writes data to the log as a new record, then fsyncs according to the
+// log's sync policy.
 func (l *Log) Append(data []byte) error {
 	header := make([]byte, 8)
 	binary.BigEndian.PutUint32(header[0:4], uint32(len(data)))
@@ -71,6 +157,31 @@ func (l *Log) Append(data []byte) error {
 	if _, err := l.f.Write(data); err != nil {
 		return fmt.Errorf("spool: write record payload: %w", err)
 	}
+	return l.maybeSync()
+}
+
+// maybeSync fsyncs the log if the sync policy calls for it after this append.
+// Under the every-append policy it always syncs; under the interval policy the
+// first append seeds the window and later appends sync only once the interval
+// has elapsed since the last sync. It is not safe for concurrent callers, but
+// neither is Append: the queue serializes both under its own lock.
+func (l *Log) maybeSync() error {
+	now := l.clock.Now()
+	if !l.policy.everyAppend {
+		if !l.started {
+			l.started = true
+			l.lastSync = now
+			return nil
+		}
+		if now.Sub(l.lastSync) < l.policy.interval {
+			return nil
+		}
+	}
+	if err := l.syncFn(); err != nil {
+		return fmt.Errorf("spool: sync log: %w", err)
+	}
+	l.lastSync = now
+	l.started = true
 	return nil
 }
 

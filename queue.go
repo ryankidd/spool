@@ -77,7 +77,8 @@ const firstLeaseID = 1
 //
 // A Queue is safe for concurrent use by multiple producers and consumers.
 type Queue struct {
-	clock Clock
+	clock      Clock
+	syncPolicy SyncPolicy
 
 	mu        sync.Mutex
 	log       *Log
@@ -99,15 +100,25 @@ func WithClock(c Clock) Option {
 	return func(q *Queue) { q.clock = c }
 }
 
+// WithSync sets the policy deciding when the queue's log fsyncs. The default is
+// SyncEveryAppend, so every Enqueue, Lease and Ack is on stable storage before
+// it returns. A looser policy (see SyncEvery) trades a bounded tail of
+// un-synced writes for throughput; the durability that costs is spelled out on
+// SyncEvery and in the package README.
+func WithSync(p SyncPolicy) Option {
+	return func(q *Queue) { q.syncPolicy = p }
+}
+
 // OpenQueue opens the queue whose log lives at path, replaying it to rebuild
 // the queue's state, then reopens the log for appending. A path that doesn't
 // exist yet gives an empty queue.
 func OpenQueue(path string, opts ...Option) (*Queue, error) {
 	q := &Queue{
-		clock:     systemClock{},
-		jobs:      make(map[uint64]*jobState),
-		leased:    make(map[uint64]struct{}),
-		nextLease: firstLeaseID,
+		clock:      systemClock{},
+		syncPolicy: SyncEveryAppend(),
+		jobs:       make(map[uint64]*jobState),
+		leased:     make(map[uint64]struct{}),
+		nextLease:  firstLeaseID,
 	}
 	for _, opt := range opts {
 		opt(q)
@@ -117,7 +128,7 @@ func OpenQueue(path string, opts ...Option) (*Queue, error) {
 		return nil, err
 	}
 
-	l, err := Open(path)
+	l, err := Open(path, WithSyncPolicy(q.syncPolicy), withClock(q.clock))
 	if err != nil {
 		return nil, err
 	}

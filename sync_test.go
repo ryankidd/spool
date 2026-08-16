@@ -119,7 +119,7 @@ func TestQueueSyncsEveryAppendByDefault(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = q.Close() })
 
-	syncs := countSyncs(q.log)
+	syncs := countSyncs(q.slog.active)
 	for i := 0; i < 3; i++ {
 		if _, err := q.Enqueue([]byte("job")); err != nil {
 			t.Fatalf("Enqueue: %v", err)
@@ -142,7 +142,7 @@ func TestQueueHonoursSyncEvery(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = q.Close() })
 
-	syncs := countSyncs(q.log)
+	syncs := countSyncs(q.slog.active)
 
 	// The queue passes its clock to the log, so enqueues within the interval
 	// batch under one deferred sync.

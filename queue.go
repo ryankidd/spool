@@ -75,19 +75,32 @@ const firstLeaseID = 1
 // effect, so the queue's state is exactly the fold of its log and survives a
 // restart by replaying it.
 //
+// The log is stored as a directory of rotating segments rather than one file,
+// so acked work does not accumulate forever: once a run of segments holds only
+// jobs that have been acked, it is dropped. See "Rotation and compaction" in
+// the package README.
+//
 // A Queue is safe for concurrent use by multiple producers and consumers.
 type Queue struct {
-	clock      Clock
-	syncPolicy SyncPolicy
+	clock           Clock
+	syncPolicy      SyncPolicy
+	maxSegmentBytes int64
 
 	mu        sync.Mutex
-	log       *Log
+	slog      *segmentedLog
 	closed    bool
 	jobs      map[uint64]*jobState
 	ready     []uint64            // ids waiting for delivery, in order
 	leased    map[uint64]struct{} // ids currently held by a consumer
 	nextJob   uint64
 	nextLease uint64
+
+	// openAtSeal records, for each sealed segment, how many jobs were still
+	// unacked at the moment it was sealed — the count of records in that
+	// segment and everything before it that a fresh replay would still need.
+	// A sealed segment whose value is zero closed over no live job and, with
+	// every earlier segment, can be dropped. See reclaimSegmentsLocked.
+	openAtSeal map[uint64]int
 }
 
 // Option configures a Queue at open time.
@@ -109,84 +122,114 @@ func WithSync(p SyncPolicy) Option {
 	return func(q *Queue) { q.syncPolicy = p }
 }
 
-// OpenQueue opens the queue whose log lives at path, replaying it to rebuild
-// the queue's state, then reopens the log for appending. A path that doesn't
-// exist yet gives an empty queue.
+// WithMaxSegmentBytes sets the size a log segment may reach before the queue
+// rolls to a new one. Rotation is what makes compaction possible: a whole
+// sealed segment is the unit that gets reclaimed once the jobs it recorded are
+// all acked. A non-positive value keeps the default. Smaller segments reclaim
+// space sooner but rotate more often; the default suits jobs of a few hundred
+// bytes.
+func WithMaxSegmentBytes(n int64) Option {
+	return func(q *Queue) {
+		if n > 0 {
+			q.maxSegmentBytes = n
+		}
+	}
+}
+
+// OpenQueue opens the queue whose log lives in the directory at path,
+// replaying it to rebuild the queue's state, then reopens the newest segment
+// for appending. The directory and its first segment are created if they don't
+// exist yet, so a fresh path gives an empty queue.
 func OpenQueue(path string, opts ...Option) (*Queue, error) {
 	q := &Queue{
-		clock:      systemClock{},
-		syncPolicy: SyncEveryAppend(),
-		jobs:       make(map[uint64]*jobState),
-		leased:     make(map[uint64]struct{}),
-		nextLease:  firstLeaseID,
+		clock:           systemClock{},
+		syncPolicy:      SyncEveryAppend(),
+		maxSegmentBytes: defaultMaxSegmentBytes,
+		jobs:            make(map[uint64]*jobState),
+		leased:          make(map[uint64]struct{}),
+		nextLease:       firstLeaseID,
+		openAtSeal:      make(map[uint64]int),
 	}
 	for _, opt := range opts {
 		opt(q)
 	}
 
-	if err := q.replay(path); err != nil {
-		return nil, err
-	}
-
-	l, err := Open(path, WithSyncPolicy(q.syncPolicy), withClock(q.clock))
+	sl, err := newSegmentedLog(path, q.clock, q.syncPolicy, q.maxSegmentBytes, q.applyRecord, q.recordSeal)
 	if err != nil {
 		return nil, err
 	}
-	q.log = l
+	q.slog = sl
+
+	q.buildReady()
+
+	// A queue that was drained before it closed can have whole segments that
+	// are already reclaimable; do that pass now rather than waiting for the
+	// next rotation.
+	q.reclaimSegmentsLocked()
 	return q, nil
 }
 
-// replay rebuilds the queue's state from the log at path.
+// applyRecord folds one log record into the queue's in-memory state during
+// replay. It is the inverse of the appends Enqueue, Lease and Ack make.
 //
 // Leases deliberately do not survive replay. A lease is a promise to one
 // consumer in one process; if the queue is being reopened, that consumer is
 // gone and waiting out its deadline would only delay the work. So a job whose
-// last record is a lease comes back ready for immediate redelivery, and the
-// log never needs to store a deadline — only the lease id, which keeps the
-// delivery count and stale-ack detection accurate across restarts.
-func (q *Queue) replay(path string) error {
-	err := Replay(path, func(data []byte) error {
-		r, err := decodeRecord(data)
-		if err != nil {
-			return err
-		}
-
-		switch r.kind {
-		case kindEnqueue:
-			if _, ok := q.jobs[r.job]; ok {
-				return fmt.Errorf("spool: duplicate enqueue record for job %d", r.job)
-			}
-			q.jobs[r.job] = &jobState{payload: r.payload}
-		case kindLease:
-			js, ok := q.jobs[r.job]
-			if !ok {
-				return fmt.Errorf("spool: lease record for unknown job %d", r.job)
-			}
-			js.lease = r.lease
-			js.deliveries++
-		case kindAck:
-			js, ok := q.jobs[r.job]
-			if !ok {
-				return fmt.Errorf("spool: ack record for unknown job %d", r.job)
-			}
-			if js.lease != r.lease {
-				return fmt.Errorf("spool: ack record for job %d carries lease %d, want %d", r.job, r.lease, js.lease)
-			}
-			delete(q.jobs, r.job)
-		}
-
-		if r.job >= q.nextJob {
-			q.nextJob = r.job + 1
-		}
-		if r.lease >= q.nextLease {
-			q.nextLease = r.lease + 1
-		}
-		return nil
-	})
+// last record is a lease comes back ready for immediate redelivery (see
+// buildReady), and the log never needs to store a deadline — only the lease
+// id, which keeps the delivery count and stale-ack detection accurate across
+// restarts.
+func (q *Queue) applyRecord(data []byte) error {
+	r, err := decodeRecord(data)
 	if err != nil {
 		return err
 	}
 
+	switch r.kind {
+	case kindEnqueue:
+		if _, ok := q.jobs[r.job]; ok {
+			return fmt.Errorf("spool: duplicate enqueue record for job %d", r.job)
+		}
+		q.jobs[r.job] = &jobState{payload: r.payload}
+	case kindLease:
+		js, ok := q.jobs[r.job]
+		if !ok {
+			return fmt.Errorf("spool: lease record for unknown job %d", r.job)
+		}
+		js.lease = r.lease
+		js.deliveries++
+	case kindAck:
+		js, ok := q.jobs[r.job]
+		if !ok {
+			return fmt.Errorf("spool: ack record for unknown job %d", r.job)
+		}
+		if js.lease != r.lease {
+			return fmt.Errorf("spool: ack record for job %d carries lease %d, want %d", r.job, r.lease, js.lease)
+		}
+		delete(q.jobs, r.job)
+	}
+
+	if r.job >= q.nextJob {
+		q.nextJob = r.job + 1
+	}
+	if r.lease >= q.nextLease {
+		q.nextLease = r.lease + 1
+	}
+	return nil
+}
+
+// recordSeal captures how many jobs are still unacked at a sealed segment's
+// boundary during replay. len(jobs) at that point is exactly the number of
+// jobs enqueued in that segment or earlier and not yet acked in that segment
+// or earlier — the segment's contribution to a fresh replay. Zero means the
+// segment, with all before it, can be dropped.
+func (q *Queue) recordSeal(seq uint64) {
+	q.openAtSeal[seq] = len(q.jobs)
+}
+
+// buildReady turns the replayed job set into the ordered ready queue. Every
+// surviving job comes back ready, since leases do not outlive a reopen.
+func (q *Queue) buildReady() {
 	q.ready = make([]uint64, 0, len(q.jobs))
 	for id, js := range q.jobs {
 		js.lease = 0
@@ -195,7 +238,6 @@ func (q *Queue) replay(path string) error {
 	}
 	// Job ids are handed out in enqueue order, so sorting restores it.
 	sort.Slice(q.ready, func(i, j int) bool { return q.ready[i] < q.ready[j] })
-	return nil
 }
 
 // Enqueue durably appends a job to the queue and returns its id. The payload
@@ -210,14 +252,66 @@ func (q *Queue) Enqueue(payload []byte) (uint64, error) {
 
 	id := q.nextJob
 	rec := record{kind: kindEnqueue, job: id, payload: payload}
-	if err := q.log.Append(rec.encode()); err != nil {
+	rotated, sealed, err := q.slog.append(rec.encode())
+	if err != nil {
 		return 0, err
 	}
 
 	q.nextJob++
 	q.jobs[id] = &jobState{payload: append([]byte(nil), payload...)}
 	q.ready = append(q.ready, id)
+	q.afterAppendLocked(rotated, sealed)
 	return id, nil
+}
+
+// afterAppendLocked runs the segment bookkeeping that follows an append which
+// rolled to a new segment. It must be called after the record's effect has
+// been applied to jobs, so len(jobs) is the segment's live-job count at seal —
+// see recordSeal. It then reclaims any segments the seal made obsolete.
+func (q *Queue) afterAppendLocked(rotated bool, sealed uint64) {
+	if !rotated {
+		return
+	}
+	q.openAtSeal[sealed] = len(q.jobs)
+	q.reclaimSegmentsLocked()
+}
+
+// reclaimSegmentsLocked drops the longest run of oldest sealed segments the
+// log no longer needs. A sealed segment is droppable once no job it recorded
+// is still live: concretely, once openAtSeal for that segment is zero, meaning
+// every job enqueued in it or earlier was also acked in it or earlier. The
+// manifest lets us jump the floor straight to the highest such segment, past
+// any earlier boundary that still had work in flight, so a busy stretch
+// between two drained points does not block reclaiming the drained prefix.
+//
+// It is deliberately conservative: a single never-acked job pins its segment
+// and everything after it, and nothing is dropped while any job that touches a
+// segment remains unacked or leaseable.
+func (q *Queue) reclaimSegmentsLocked() {
+	target, found := uint64(0), false
+	for seq, open := range q.openAtSeal {
+		if open != 0 || seq >= q.slog.activeSeq {
+			continue
+		}
+		if !found || seq > target {
+			target, found = seq, true
+		}
+	}
+	if !found {
+		return
+	}
+	if err := q.slog.dropThrough(target); err != nil {
+		// Reclamation is durability housekeeping, not a correctness step: the
+		// dropped segments only hold already-acked work. If it fails, leave
+		// them in place and retry after the next rotation rather than failing
+		// the caller's operation.
+		return
+	}
+	for seq := range q.openAtSeal {
+		if seq <= target {
+			delete(q.openAtSeal, seq)
+		}
+	}
 }
 
 // reclaimLocked returns every job whose lease has expired to the ready
@@ -280,7 +374,8 @@ func (q *Queue) Lease(d time.Duration) (*Job, error) {
 	lease := q.nextLease
 
 	rec := record{kind: kindLease, job: id, lease: lease}
-	if err := q.log.Append(rec.encode()); err != nil {
+	rotated, sealed, err := q.slog.append(rec.encode())
+	if err != nil {
 		return nil, err
 	}
 
@@ -290,6 +385,7 @@ func (q *Queue) Lease(d time.Duration) (*Job, error) {
 	js.lease = lease
 	js.deadline = now.Add(d)
 	js.deliveries++
+	q.afterAppendLocked(rotated, sealed)
 
 	return &Job{
 		ID:         id,
@@ -327,12 +423,14 @@ func (q *Queue) Ack(j *Job) error {
 	}
 
 	rec := record{kind: kindAck, job: j.ID, lease: j.LeaseID}
-	if err := q.log.Append(rec.encode()); err != nil {
+	rotated, sealed, err := q.slog.append(rec.encode())
+	if err != nil {
 		return err
 	}
 
 	delete(q.jobs, j.ID)
 	delete(q.leased, j.ID)
+	q.afterAppendLocked(rotated, sealed)
 	return nil
 }
 
@@ -357,5 +455,5 @@ func (q *Queue) Close() error {
 		return ErrClosed
 	}
 	q.closed = true
-	return q.log.Close()
+	return q.slog.close()
 }

@@ -2,12 +2,15 @@
 
 A crash-safe job queue in Go, built on an append-only write-ahead log. Every
 state change — enqueue, lease, ack — is written to the log before it takes
-effect, so the queue's state is exactly the fold of its log: reopen the file
-and you get the same queue back, minus anything a `kill -9` interrupted
-mid-write.
+effect, so the queue's state is exactly the fold of its log: reopen the
+directory and you get the same queue back, minus anything a `kill -9`
+interrupted mid-write.
 
-There is no server and no background goroutine. `spool` is a library over one
-file, safe for concurrent use within a single process. See "Status" below for
+There is no server and no background goroutine. `spool` is a library over a
+small directory of append-only log segments, safe for concurrent use within a
+single process. Rotating the log into segments is what lets it reclaim the
+space acked jobs leave behind, so the directory tracks queue depth rather than
+total throughput — see "Rotation and compaction". See "Status" below for
 exactly which guarantees are and aren't in place.
 
 ## Install
@@ -30,7 +33,7 @@ import (
 )
 
 func main() {
-	q, err := spool.OpenQueue("jobs.wal")
+	q, err := spool.OpenQueue("jobs.queue")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -61,7 +64,7 @@ func main() {
 
 | call | does |
 |------|------|
-| `OpenQueue(path, opts...)` | Replays the log at `path` to rebuild state, then opens it for appending. A missing file is an empty queue. |
+| `OpenQueue(path, opts...)` | Replays the log directory at `path` to rebuild state, then opens the newest segment for appending. A missing directory is an empty queue. |
 | `Enqueue(payload) (id, error)` | Durably adds a job and returns its id. The payload is copied. |
 | `Lease(d) (*Job, error)` | Hands the oldest ready job to the caller with a deadline `d` from now. Returns `ErrEmpty` if nothing is ready. |
 | `Ack(job) error` | Durably completes a job. Returns `ErrLeaseExpired` if that lease is no longer the current delivery. |
@@ -69,6 +72,7 @@ func main() {
 | `Close() error` | Closes the log. Later calls return `ErrClosed`. |
 | `WithClock(c)` | Option replacing the clock used for lease deadlines — mainly so tests can expire a lease without sleeping. |
 | `WithSync(p)` | Option choosing when the log fsyncs: `SyncEveryAppend()` (default) or `SyncEvery(d)` for a looser, higher-throughput policy. See "Durability and fsync". |
+| `WithMaxSegmentBytes(n)` | Option setting the size a segment may reach before the log rolls to a new one. A whole sealed segment is the unit of compaction. See "Rotation and compaction". |
 
 A `Job` carries its `ID` (stable across redeliveries), `Payload`, `LeaseID`
 (new on every delivery), `Deadline`, and `Deliveries`, the number of times it
@@ -153,11 +157,57 @@ trailing record before the next append.
 The same option is available on the raw log as `Open(path,
 spool.WithSyncPolicy(p))`.
 
+### Rotation and compaction
+
+The log is a directory of numbered, append-only **segments**. Appends go to the
+newest segment; once it passes `WithMaxSegmentBytes` (4 MiB by default) the next
+append rolls to a fresh one and the old segment is **sealed** — closed, fsynced,
+never written again. A record is never split across a boundary, so replaying the
+segments in order is exactly replaying one long log.
+
+Sealing is what makes reclamation possible. A whole sealed segment is dropped
+once it is **fully obsolete**: every job with a record in it has been acked
+*and* that ack was itself recorded no later than the segment. Precisely, the
+queue drops the oldest run of segments up to the newest sealed segment `i` for
+which the count of jobs enqueued in segments `0..i` but not yet acked in
+segments `0..i` is zero. At that boundary the segments before it net to nothing
+— every job they opened was also closed within them — so a fresh replay of the
+segments after it reconstructs the identical queue. Anything still unacked or
+leaseable keeps its segment, and every segment after it, alive.
+
+This is deliberately conservative, and what it promises is narrow:
+
+- **Growth is bounded by un-acked work, not by throughput.** As jobs are acked
+  and the queue drains, old segments are reclaimed, so the directory tracks how
+  much work is outstanding rather than how much has ever passed through. A
+  batch workload that drains between batches reclaims almost everything.
+- **A backlog is not reclaimed.** Reclamation can only advance to a point in the
+  log where nothing enqueued before it is still outstanding. A queue that is
+  never drained — always some job in flight across every rotation — keeps
+  growing, because there is no such point. In the limit, a **single job that is
+  never acked** (a poison job redelivered forever, or one nobody leases) pins
+  its segment and everything after it indefinitely. `Job.Deliveries` is there so
+  a consumer can decide to drop such a job and let the log move on.
+- **No online rewrite.** Reclamation only ever drops whole sealed segments; it
+  never rewrites a live segment to squeeze out the acked records mixed into it.
+  So the floor advances in segment-sized steps, and a mostly-acked segment that
+  still holds one live job is kept in full.
+
+Reclamation is crash-safe. A small `manifest` file records the lowest live
+segment; it is updated with a durable atomic rename *before* any segment file is
+unlinked, so a crash mid-compaction leaves at worst some already-superseded
+segment files below the floor, which the next open ignores and sweeps away.
+Rotation is crash-safe too: a crash mid-rotation loses at most the in-flight
+append that triggered it, exactly as any torn write does.
+
 ## On-disk format
 
-The log underneath the queue is exported too — `Open`, `Append` and `Replay`
-give you the raw record stream if you want a different set of semantics over
-it. Each record is written as:
+Each queue segment is a single append-only log file, and that primitive is
+exported too — `Open`, `Append` and `Replay` give you the raw record stream of
+one file if you want a different set of semantics over it. The queue composes a
+directory of these files, one per segment, plus a `manifest` recording the
+lowest live segment (see "Rotation and compaction"). Within a file, each record
+is written as:
 
 | field    | size    | meaning                          |
 |----------|---------|-----------------------------------|
@@ -199,14 +249,21 @@ What this gives you today:
   just a killed process; `WithSync(SyncEvery(d))` relaxes that to at most one
   sync per interval, trading a bounded un-synced tail for throughput. Both are
   spelled out under "Durability and fsync", and `Close` flushes under either.
-- Recovery from a torn write. If the process is killed mid-`Append`, the log
-  file ends with a partial header, a partial payload, or a payload that
-  landed corrupted — `Replay` discards that trailing record and returns
-  everything before it, with no error. This only applies to the *last*
-  record physically in the file: a checksum mismatch on a record that has
-  more valid log after it can't be a torn write (`Append` only ever extends
-  the file), so it's treated as real corruption and `Replay` returns a hard
-  error instead of silently dropping data.
+- Recovery from a torn write. If the process is killed mid-`Append`, the
+  active segment ends with a partial header, a partial payload, or a payload
+  that landed corrupted — recovery discards that trailing record and keeps
+  everything before it, with no error. This only applies to the *last* record
+  physically in the newest segment: a checksum mismatch or short read anywhere
+  earlier — mid-segment, or at the tail of a sealed segment — can't be a torn
+  write (`Append` only ever extends the active file, and a sealed segment was
+  finished before the next one existed), so it's treated as real corruption and
+  reported as a hard error instead of silently dropping data.
+- Segment rotation and compaction. The log rotates into fixed-size segments and
+  drops whole segments once every job they recorded has been acked, so the log
+  grows with outstanding work rather than with total throughput. It is
+  conservative — a still-unacked job pins its segment — and never rewrites a
+  live segment. What it does and does not promise is spelled out under
+  "Rotation and compaction".
 - Repeated recovery. `Open` truncates a torn trailing record away before it
   accepts any append, so the next write starts at the end of the last intact
   record rather than after the damaged bytes. Crashing mid-`Append`,
@@ -219,12 +276,12 @@ What this does **not** give you yet:
 
 - Not exactly-once. See "Delivery semantics" above: a job whose lease expires
   is delivered again, whether or not the work was actually done.
-- No compaction. The log records every transition forever, including jobs
-  that were acked long ago, so the file grows with throughput rather than
-  with queue depth, and open time is proportional to total history. A
-  compaction pass that rewrites the log down to live jobs is planned.
-- One process per log file. There is no locking, and two `Queue` values over
-  the same path — in one process or two — will interleave their appends and
+- No online segment rewrite. Compaction drops whole obsolete segments but never
+  rewrites a live one, so a never-draining queue — or a single job that is never
+  acked — keeps its segments and the log keeps growing. Bounded growth holds
+  only to the extent work is actually acked; see "Rotation and compaction".
+- One process per log directory. There is no locking, and two `Queue` values
+  over the same path — in one process or two — will interleave their appends and
   diverge from each other.
 - No nack, no dead-letter queue, no maximum attempt count, no scheduled or
   delayed jobs, no priorities. A job that fails forever is redelivered

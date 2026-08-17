@@ -271,6 +271,10 @@ What this gives you today:
   once. Mid-log corruption is reported by `Open` too, and the file is left
   untouched in that case — truncating there would discard valid records
   sitting behind the damage.
+- Crash-tested, not just unit-tested. A fuzzer kills a real worker process
+  with `SIGKILL` at arbitrary points mid-write, across many seeds, and checks
+  that no job the worker reported acked is ever lost or redelivered after
+  recovery. A short pass runs on every build; see "Test".
 
 What this does **not** give you yet:
 
@@ -291,4 +295,16 @@ What this does **not** give you yet:
 
 ```sh
 go test ./... -race
+```
+
+Alongside the unit tests, a crash fuzzer builds a small worker that drives a
+real queue through a randomized enqueue/lease/ack workload — recording each
+job id only after its ack has returned durable — then kills that worker with
+`SIGKILL` at an arbitrary point mid-write, reopens the queue, and asserts that
+nothing the worker reported acked comes back as live work. A short, bounded
+pass runs on every `go test`; set `SPOOL_CRASH_SEEDS` to sweep many more kill
+points locally:
+
+```sh
+SPOOL_CRASH_SEEDS=500 go test -run TestCrashRecovery -count=1
 ```

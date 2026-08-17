@@ -46,6 +46,21 @@ jobs:
           go-version: stable
       - run: go test ./... -race -shuffle=on -count=10
 
+  # The crash fuzzer kills a worker mid-write and checks that recovery never
+  # loses an acked job. The normal suite runs a short pass on every matrix
+  # cell; this runs a much larger seed sweep so more kill points are covered.
+  crash:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go test -race -run TestCrashRecovery ./...
+        env:
+          SPOOL_CRASH_SEEDS: "200"
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -1,5 +1,7 @@
 # spool
 
+[![CI](https://github.com/ryankidd/spool/actions/workflows/ci.yml/badge.svg)](https://github.com/ryankidd/spool/actions/workflows/ci.yml)
+
 A crash-safe job queue in Go, built on an append-only write-ahead log. Every
 state change — enqueue, lease, ack — is written to the log before it takes
 effect, so the queue's state is exactly the fold of its log: reopen the
@@ -352,3 +354,7 @@ points locally:
 ```sh
 SPOOL_CRASH_SEEDS=500 go test -run TestCrashRecovery -count=1
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

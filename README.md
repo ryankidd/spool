@@ -13,6 +13,50 @@ space acked jobs leave behind, so the directory tracks queue depth rather than
 total throughput — see "Rotation and compaction". See "Status" below for
 exactly which guarantees are and aren't in place.
 
+## Guarantees
+
+The precise contract, so it can be relied on without reading the rest of the
+document. Everything here is qualified in detail below.
+
+**What `spool` promises:**
+
+- **Nothing acknowledged is lost.** Under the default `SyncEveryAppend()`
+  policy, once `Enqueue`, `Lease` or `Ack` returns success its record is
+  `fsync`ed to disk and survives a power loss or kernel panic, not just a
+  killed process.
+- **State is the fold of the log.** Reopening the directory replays every
+  record and reconstructs the identical queue — ready jobs, in enqueue order,
+  with delivery counts intact.
+- **At-least-once delivery.** A leased job is invisible to other consumers
+  until it is acked or its lease expires; a lease that expires without an ack
+  is redelivered.
+- **Torn writes are recovered.** A `kill -9` mid-append leaves at most one
+  partial trailing record, which `Open` discards before the next write; every
+  record before it survives. This is survivable across repeated crash/reopen
+  cycles, not just once.
+- **Real corruption is reported, not hidden.** A checksum mismatch or short
+  read anywhere but the torn tail is returned as a hard error with the file
+  left intact, rather than silently dropping data.
+- **Growth is bounded by outstanding work.** Sealed segments are reclaimed
+  once every job they recorded is acked, so the directory tracks queue depth
+  rather than total throughput.
+
+**What it explicitly does not promise:**
+
+- **Not exactly-once.** A job whose lease expires is delivered again whether
+  or not the work was done; jobs must be idempotent.
+- **`SyncEvery(d)` risks a bounded tail.** The looser policy trades durability
+  for throughput: writes made since the last sync are only in the page cache
+  and a power loss discards them. It never risks more than that un-synced tail.
+- **A never-drained queue keeps growing.** Compaction drops whole obsolete
+  segments but never rewrites a live one, so a single never-acked job pins its
+  segment and every segment after it.
+- **One process per directory.** There is no cross-process locking; two queues
+  over the same path interleave their appends and diverge.
+- **No nack, dead-letter, retry limit, delay, or priority.** A job that fails
+  forever is redelivered forever; `Job.Deliveries` is the hook for a consumer
+  to give up on it.
+
 ## Install
 
 ```sh
